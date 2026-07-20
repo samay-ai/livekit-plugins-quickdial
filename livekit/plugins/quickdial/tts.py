@@ -214,7 +214,10 @@ class SynthesizeStream(tts.SynthesizeStream):
                 self._mark_started()
                 await ws.send_str(json.dumps(msg))
 
+        segment_open = False
+
         async def _recv(ws: aiohttp.ClientWebSocketResponse) -> None:
+            nonlocal segment_open
             while True:
                 frame = await ws.receive()
                 if frame.type in (
@@ -224,17 +227,24 @@ class SynthesizeStream(tts.SynthesizeStream):
                 ):
                     break
                 if frame.type == aiohttp.WSMsgType.BINARY:
+                    if not segment_open:  # streaming emitter needs an open segment
+                        output_emitter.start_segment(segment_id=utils.shortuuid())
+                        segment_open = True
                     output_emitter.push(frame.data)  # 16-bit PCM @ 24 kHz
                 elif frame.type == aiohttp.WSMsgType.TEXT:
                     evt = json.loads(frame.data)
                     if evt.get("type") == "end":
-                        output_emitter.flush()
+                        if segment_open:
+                            output_emitter.end_segment()
+                            segment_open = False
                     elif evt.get("type") == "error":
                         raise APIStatusError(message=evt.get("message", "tts error"))
 
         try:
             async with self._tts._ensure_session().ws_connect(url) as ws:
                 await asyncio.gather(_send(ws), _recv(ws))
+                if segment_open:
+                    output_emitter.end_segment()
         except asyncio.TimeoutError as e:
             raise APITimeoutError() from e
         except aiohttp.ClientResponseError as e:
