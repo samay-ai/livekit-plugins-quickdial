@@ -9,6 +9,7 @@
 Pair with a VAD (e.g. ``silero.VAD``) so end-of-utterance is detected; the plugin
 emits a FINAL_TRANSCRIPT per utterance (no interim results yet).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -30,7 +31,6 @@ from livekit.agents import (
 from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS, NOT_GIVEN, NotGivenOr
 from livekit.agents.utils import AudioBuffer, is_given
 
-from .log import logger
 from .models import STTLanguages
 
 DEFAULT_BASE_URL = "https://api.quickdial.ai"
@@ -110,7 +110,9 @@ class STT(stt.STT):
                 f"{self._opts.base_url}/v1/stt",
                 headers={"Authorization": f"Bearer {self._opts.api_key}"},
                 data=form,
-                timeout=aiohttp.ClientTimeout(total=30, sock_connect=conn_options.timeout),
+                timeout=aiohttp.ClientTimeout(
+                    total=30, sock_connect=conn_options.timeout
+                ),
             ) as resp:
                 resp.raise_for_status()
                 data = await resp.json()
@@ -150,12 +152,19 @@ class SpeechStream(stt.SpeechStream):
     def __init__(
         self, *, stt: STT, opts: _STTOptions, conn_options: APIConnectOptions
     ) -> None:
-        super().__init__(stt=stt, conn_options=conn_options, sample_rate=opts.sample_rate)
+        super().__init__(
+            stt=stt, conn_options=conn_options, sample_rate=opts.sample_rate
+        )
         self._stt: STT = stt
         self._opts = opts
 
     async def _run(self) -> None:
-        url = f"{self._opts.ws_url}?key={self._opts.api_key}"
+        # Send the API key in the Authorization header (not the URL query string) so it
+        # isn't captured in proxy/access logs. The Quickdial WS endpoint accepts a Bearer
+        # header; the ?key= query param is only needed for browser clients that can't set
+        # WS handshake headers.
+        url = self._opts.ws_url
+        ws_headers = {"Authorization": f"Bearer {self._opts.api_key}"}
 
         async def _send(ws: aiohttp.ClientWebSocketResponse) -> None:
             cfg = dict(self._opts.params or {})
@@ -195,7 +204,9 @@ class SpeechStream(stt.SpeechStream):
                         self._event_ch.send_nowait(
                             stt.SpeechEvent(type=stt.SpeechEventType.START_OF_SPEECH)
                         )
-                        self._event_ch.send_nowait(_to_speech_event(evt, self._opts.language))
+                        self._event_ch.send_nowait(
+                            _to_speech_event(evt, self._opts.language)
+                        )
                         self._event_ch.send_nowait(
                             stt.SpeechEvent(type=stt.SpeechEventType.END_OF_SPEECH)
                         )
@@ -203,8 +214,14 @@ class SpeechStream(stt.SpeechStream):
                     raise APIStatusError(message=evt.get("message", "stt error"))
 
         try:
-            async with self._stt._ensure_session().ws_connect(url) as ws:
+            async with self._stt._ensure_session().ws_connect(
+                url, headers=ws_headers
+            ) as ws:
                 await asyncio.gather(_send(ws), _recv(ws))
+        except (APITimeoutError, APIStatusError, APIConnectionError):
+            # already-typed API errors (e.g. a server "error" event) must propagate as-is
+            # so non-retryable failures aren't relabeled as retryable connection errors.
+            raise
         except asyncio.TimeoutError as e:
             raise APITimeoutError() from e
         except aiohttp.ClientResponseError as e:

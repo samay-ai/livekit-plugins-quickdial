@@ -9,6 +9,7 @@ Two paths, both emitting 16-bit PCM mono @ 24 kHz:
 
 Auth is a Bearer API key (``qdl_live_…``). Get one at https://web.quickdial.ai.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -30,7 +31,6 @@ from livekit.agents import (
 from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS, NOT_GIVEN, NotGivenOr
 from livekit.agents.utils import is_given
 
-from .log import logger
 from .models import TTSVoices
 
 DEFAULT_BASE_URL = "https://api.quickdial.ai"
@@ -114,7 +114,10 @@ class TTS(tts.TTS):
         return self._session
 
     def update_options(
-        self, *, voice: NotGivenOr[str] = NOT_GIVEN, params: NotGivenOr[dict] = NOT_GIVEN
+        self,
+        *,
+        voice: NotGivenOr[str] = NOT_GIVEN,
+        params: NotGivenOr[dict] = NOT_GIVEN,
     ) -> None:
         if is_given(voice):
             self._opts.voice = voice
@@ -124,7 +127,10 @@ class TTS(tts.TTS):
             s.update_options(voice=voice, params=params)
 
     def synthesize(
-        self, text: str, *, conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS
+        self,
+        text: str,
+        *,
+        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
     ) -> ChunkedStream:
         return ChunkedStream(tts=self, input_text=text, conn_options=conn_options)
 
@@ -139,13 +145,19 @@ class TTS(tts.TTS):
 class ChunkedStream(tts.ChunkedStream):
     """One-shot synthesis over ``POST /v1/tts`` (streaming WAV)."""
 
-    def __init__(self, *, tts: TTS, input_text: str, conn_options: APIConnectOptions) -> None:
+    def __init__(
+        self, *, tts: TTS, input_text: str, conn_options: APIConnectOptions
+    ) -> None:
         super().__init__(tts=tts, input_text=input_text, conn_options=conn_options)
         self._tts: TTS = tts
         self._opts = replace(tts._opts)
 
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
-        body: dict = {"text": self._input_text, "voice": self._opts.voice, "format": "wav"}
+        body: dict = {
+            "text": self._input_text,
+            "voice": self._opts.voice,
+            "format": "wav",
+        }
         if self._opts.params:
             body["params"] = self._opts.params
         headers = {
@@ -157,7 +169,9 @@ class ChunkedStream(tts.ChunkedStream):
                 f"{self._opts.base_url}/v1/tts",
                 headers=headers,
                 json=body,
-                timeout=aiohttp.ClientTimeout(total=30, sock_connect=self._conn_options.timeout),
+                timeout=aiohttp.ClientTimeout(
+                    total=30, sock_connect=self._conn_options.timeout
+                ),
             ) as resp:
                 resp.raise_for_status()
                 output_emitter.initialize(
@@ -186,7 +200,10 @@ class SynthesizeStream(tts.SynthesizeStream):
         self._opts = replace(tts._opts)
 
     def update_options(
-        self, *, voice: NotGivenOr[str] = NOT_GIVEN, params: NotGivenOr[dict] = NOT_GIVEN
+        self,
+        *,
+        voice: NotGivenOr[str] = NOT_GIVEN,
+        params: NotGivenOr[dict] = NOT_GIVEN,
     ) -> None:
         if is_given(voice):
             self._opts.voice = voice
@@ -202,7 +219,12 @@ class SynthesizeStream(tts.SynthesizeStream):
             mime_type="audio/pcm",
             stream=True,
         )
-        url = f"{self._opts.ws_url}?key={self._opts.api_key}"
+        # Send the API key in the Authorization header (not the URL query string) so it
+        # isn't captured in proxy/access logs. The Quickdial WS endpoint accepts a Bearer
+        # header; the ?key= query param is only needed for browser clients that can't set
+        # WS handshake headers.
+        url = self._opts.ws_url
+        ws_headers = {"Authorization": f"Bearer {self._opts.api_key}"}
 
         async def _send(ws: aiohttp.ClientWebSocketResponse) -> None:
             # Aggregate text tokens between flush markers and synthesize ONCE per
@@ -255,10 +277,16 @@ class SynthesizeStream(tts.SynthesizeStream):
                         raise APIStatusError(message=evt.get("message", "tts error"))
 
         try:
-            async with self._tts._ensure_session().ws_connect(url) as ws:
+            async with self._tts._ensure_session().ws_connect(
+                url, headers=ws_headers
+            ) as ws:
                 await asyncio.gather(_send(ws), _recv(ws))
                 if segment_open:
                     output_emitter.end_segment()
+        except (APITimeoutError, APIStatusError, APIConnectionError):
+            # already-typed API errors (e.g. a server "error" event) must propagate as-is
+            # so non-retryable failures aren't relabeled as retryable connection errors.
+            raise
         except asyncio.TimeoutError as e:
             raise APITimeoutError() from e
         except aiohttp.ClientResponseError as e:
