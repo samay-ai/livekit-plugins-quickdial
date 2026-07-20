@@ -75,8 +75,12 @@ class TTS(tts.TTS):
             params: optional Pocket-TTS knobs (``temperature``, ``speed``, …).
             word_tokenizer: sentence/word tokenizer for the streaming path.
         """
+        # Non-streaming: the AgentSession synthesizes the whole reply in one
+        # POST /v1/tts, giving continuous audio (no per-sentence generation gaps
+        # that make WS-per-flush synthesis sound choppy). The WS SynthesizeStream
+        # remains available for advanced/low-latency use.
         super().__init__(
-            capabilities=tts.TTSCapabilities(streaming=True),
+            capabilities=tts.TTSCapabilities(streaming=False),
             sample_rate=sample_rate,
             num_channels=NUM_CHANNELS,
         )

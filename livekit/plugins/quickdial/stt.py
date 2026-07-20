@@ -62,8 +62,12 @@ class STT(stt.STT):
         params: NotGivenOr[dict] = NOT_GIVEN,
         http_session: aiohttp.ClientSession | None = None,
     ) -> None:
+        # Quickdial returns a transcript per utterance (no interim results), so we
+        # run as a NON-streaming STT: the AgentSession's VAD segments speech and
+        # calls _recognize_impl (POST /v1/stt) per utterance. This is the reliable
+        # path; the WS SpeechStream remains available for advanced use.
         super().__init__(
-            capabilities=stt.STTCapabilities(streaming=True, interim_results=False)
+            capabilities=stt.STTCapabilities(streaming=False, interim_results=False)
         )
         key = api_key if is_given(api_key) else os.environ.get("QUICKDIAL_API_KEY", "")
         if not key:
