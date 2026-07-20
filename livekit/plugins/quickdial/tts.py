@@ -201,18 +201,28 @@ class SynthesizeStream(tts.SynthesizeStream):
         url = f"{self._opts.ws_url}?key={self._opts.api_key}"
 
         async def _send(ws: aiohttp.ClientWebSocketResponse) -> None:
-            # collect the incoming text stream into sentences, synth each in order
-            async for data in self._input_ch:
-                if isinstance(data, self._FlushSentinel):
-                    continue
-                text = data if isinstance(data, str) else str(data)
-                if not text.strip():
-                    continue
+            # Aggregate text tokens between flush markers and synthesize ONCE per
+            # flush — LiveKit expects one output segment per flush, so we must not
+            # send a request per token (that yields "segments mismatch").
+            pending: list[str] = []
+
+            async def _flush() -> None:
+                text = "".join(pending).strip()
+                pending.clear()
+                if not text:
+                    return
                 msg: dict = {"text": text, "voice": self._opts.voice}
                 if self._opts.params:
                     msg["params"] = self._opts.params
                 self._mark_started()
                 await ws.send_str(json.dumps(msg))
+
+            async for data in self._input_ch:
+                if isinstance(data, self._FlushSentinel):
+                    await _flush()
+                else:
+                    pending.append(data if isinstance(data, str) else str(data))
+            await _flush()  # trailing text at end of input
 
         segment_open = False
 
