@@ -62,12 +62,12 @@ class STT(stt.STT):
         params: NotGivenOr[dict] = NOT_GIVEN,
         http_session: aiohttp.ClientSession | None = None,
     ) -> None:
-        # Quickdial returns a transcript per utterance (no interim results), so we
-        # run as a NON-streaming STT: the AgentSession's VAD segments speech and
-        # calls _recognize_impl (POST /v1/stt) per utterance. This is the reliable
-        # path; the WS SpeechStream remains available for advanced use.
+        # Streaming STT: the WS SpeechStream (/v1/stt/stream) sends PCM frames as the
+        # caller speaks and receives interim `partial` transcripts + a `transcript`
+        # (final) at end-of-utterance. Transcription overlaps with speech, so the final
+        # is ready ~immediately after the caller stops — no batch "after speech" wait.
         super().__init__(
-            capabilities=stt.STTCapabilities(streaming=False, interim_results=False)
+            capabilities=stt.STTCapabilities(streaming=True, interim_results=True)
         )
         key = api_key if is_given(api_key) else os.environ.get("QUICKDIAL_API_KEY", "")
         if not key:
@@ -186,6 +186,7 @@ class SpeechStream(stt.SpeechStream):
                     await ws.send_bytes(f.data.tobytes())
 
         async def _recv(ws: aiohttp.ClientWebSocketResponse) -> None:
+            speaking = False  # have we emitted START_OF_SPEECH for the current utterance?
             while True:
                 frame = await ws.receive()
                 if frame.type in (
@@ -198,18 +199,35 @@ class SpeechStream(stt.SpeechStream):
                     continue
                 evt = json.loads(frame.data)
                 t = evt.get("type")
-                if t == "transcript":
+                if t == "partial":
                     text = (evt.get("text") or "").strip()
-                    if text:
+                    if not text:
+                        continue
+                    if not speaking:
+                        speaking = True
                         self._event_ch.send_nowait(
                             stt.SpeechEvent(type=stt.SpeechEventType.START_OF_SPEECH)
                         )
-                        self._event_ch.send_nowait(
-                            _to_speech_event(evt, self._opts.language)
+                    self._event_ch.send_nowait(
+                        stt.SpeechEvent(
+                            type=stt.SpeechEventType.INTERIM_TRANSCRIPT,
+                            alternatives=[
+                                stt.SpeechData(language=self._opts.language, text=text)
+                            ],
                         )
+                    )
+                elif t == "transcript":
+                    if not speaking:
                         self._event_ch.send_nowait(
-                            stt.SpeechEvent(type=stt.SpeechEventType.END_OF_SPEECH)
+                            stt.SpeechEvent(type=stt.SpeechEventType.START_OF_SPEECH)
                         )
+                    self._event_ch.send_nowait(
+                        _to_speech_event(evt, self._opts.language)
+                    )
+                    self._event_ch.send_nowait(
+                        stt.SpeechEvent(type=stt.SpeechEventType.END_OF_SPEECH)
+                    )
+                    speaking = False
                 elif t == "error":
                     raise APIStatusError(message=evt.get("message", "stt error"))
 
